@@ -22,7 +22,11 @@
  *   inSeasonEligible grade xp xpNeededForCurrentGrade xpNeededForNextGrade seasonYear
  *   serialNumber secondaryMarketFeeEnabled pictureUrl anyPositions liveSingleSaleOffer
  *   anyPlayer { slug displayName } } pageInfo } }
- * - anyPlayer(slug) { lowestPriceAnyCard(rarity, inSeason) { ... } }
+ * - anyPlayer(slug) { lowestPriceAnyCard(rarity, inSeason) {
+ *     liveSingleSaleOffer { ... }
+ *     publicMinPrices { eurCents referenceCurrency }
+ *     privateMinPrices { eurCents referenceCurrency }
+ *   } }
  * ============================================================================
  */
 
@@ -179,6 +183,7 @@ const QUERIES = Object.freeze({
     }
   `,
 
+  // FIX: aggiunta publicMinPrices e privateMinPrices come fallback al liveSingleSaleOffer
   playerFloor: `
     query PlayerFloor($slug: String!, $rarity: Rarity, $inSeason: Boolean) {
       anyPlayer(slug: $slug) {
@@ -194,6 +199,14 @@ const QUERIES = Object.freeze({
                 referenceCurrency
               }
             }
+          }
+          publicMinPrices {
+            eurCents
+            referenceCurrency
+          }
+          privateMinPrices {
+            eurCents
+            referenceCurrency
           }
         }
       }
@@ -365,6 +378,23 @@ function AGGIORNA_CAMBI_SOLO() {
       log_('FX', gallery.key, 'ERRORE: ' + errorMessage_(e));
     }
   });
+}
+
+/**
+ * Svuota tutta la cache floor (utile dopo fix o quando i floor risultano vuoti).
+ * Eseguire manualmente una volta dalla UI Apps Script.
+ */
+function clearAllFloorCache() {
+  const props = PropertiesService.getScriptProperties();
+  const allKeys = props.getKeys();
+  let cleared = 0;
+  allKeys.forEach(function(key) {
+    if (key.indexOf(CONFIG.stateKeys.floorCachePrefix) === 0) {
+      props.deleteProperty(key);
+      cleared++;
+    }
+  });
+  log_('SYSTEM', 'CACHE', 'Floor cache svuotata: ' + cleared + ' voci rimosse');
 }
 
 function runLightSyncForGallery_(gallery, startMs) {
@@ -684,6 +714,12 @@ function fetchGalleryCards_(userSlug, startMs) {
   return allCards;
 }
 
+/**
+ * FIX: ora usa 3 livelli di fallback per trovare il floor price:
+ *  1. liveSingleSaleOffer  -> offerta live diretta sulla carta
+ *  2. publicMinPrices      -> prezzo minimo pubblico aggregato
+ *  3. privateMinPrices     -> prezzo minimo privato aggregato
+ */
 function fetchPlayerFloor_(playerSlug, rarity, inSeason) {
   const response = sorareGraphqlFetch_(QUERIES.playerFloor, {
     slug: playerSlug,
@@ -693,7 +729,34 @@ function fetchPlayerFloor_(playerSlug, rarity, inSeason) {
 
   const card = response && response.data && response.data.anyPlayer && response.data.anyPlayer.lowestPriceAnyCard;
   if (!card) return '';
-  return extractEurSalePrice_(card.liveSingleSaleOffer);
+
+  // Priorità 1: offerta live diretta
+  const fromOffer = extractEurSalePrice_(card.liveSingleSaleOffer);
+  if (fromOffer !== '') {
+    log_('FLOOR', 'PRICE', playerSlug + ' | ' + rarity + ' | liveSingleSaleOffer=' + fromOffer);
+    return fromOffer;
+  }
+
+  // Priorità 2: prezzo minimo pubblico aggregato
+  if (card.publicMinPrices &&
+      card.publicMinPrices.eurCents !== null &&
+      typeof card.publicMinPrices.eurCents !== 'undefined') {
+    const fromPublic = parseFloat((Number(card.publicMinPrices.eurCents) / 100).toFixed(2));
+    log_('FLOOR', 'PRICE', playerSlug + ' | ' + rarity + ' | publicMinPrices=' + fromPublic);
+    return fromPublic;
+  }
+
+  // Priorità 3: prezzo minimo privato aggregato
+  if (card.privateMinPrices &&
+      card.privateMinPrices.eurCents !== null &&
+      typeof card.privateMinPrices.eurCents !== 'undefined') {
+    const fromPrivate = parseFloat((Number(card.privateMinPrices.eurCents) / 100).toFixed(2));
+    log_('FLOOR', 'PRICE', playerSlug + ' | ' + rarity + ' | privateMinPrices=' + fromPrivate);
+    return fromPrivate;
+  }
+
+  log_('FLOOR', 'PRICE', playerSlug + ' | ' + rarity + ' | nessun prezzo disponibile');
+  return '';
 }
 
 function sorareGraphqlFetch_(query, variables) {
